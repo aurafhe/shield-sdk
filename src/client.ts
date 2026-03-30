@@ -1,65 +1,120 @@
-import { EncryptedIntent, SwapQuote, SwapResult } from './types'
+import type {
+  EncryptedIntent,
+  GatewayResponse,
+  QuoteResult,
+  PrepareResult,
+  ExecuteResult,
+  ExecuteRequest,
+} from './types'
 
-export const DEFAULT_API_ENDPOINT = 'https://api.afhe.io'
+export const DEFAULT_GATEWAY_URL = 'https://api.afhe.io'
 
-/** HTTP client for the Aura coprocessor API */
+/** Error thrown when the coprocessor gateway returns an error */
+export class GatewayError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly log?: string,
+  ) {
+    super(message)
+    this.name = 'GatewayError'
+  }
+}
+
+/** HTTP client for the Aura coprocessor gateway API */
 export class CoprocessorClient {
-  private endpoint: string
+  private baseUrl: string
 
-  constructor(endpoint: string = DEFAULT_API_ENDPOINT) {
-    this.endpoint = endpoint.replace(/\/$/, '')
+  constructor(gatewayUrl: string = DEFAULT_GATEWAY_URL) {
+    this.baseUrl = gatewayUrl.replace(/\/$/, '')
   }
 
   /**
-   * Submit an encrypted swap intent to the coprocessor network.
-   * The coprocessor performs token resolution, slippage validation,
-   * and fee calculation — all on ciphertext.
-   *
-   * @param intent - Encrypted swap intent from encryptSwapParams()
-   * @returns Quote with execution transaction (ready to sign)
+   * Check if the gateway is healthy.
    */
-  async submitIntent(intent: EncryptedIntent): Promise<SwapQuote> {
-    // TODO: Replace stub with real coprocessor API call
-    // const res = await fetch(`${this.endpoint}/v1/intents`, {
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify(intent),
-    // })
-    // if (!res.ok) throw new Error(`Coprocessor error: ${res.status}`)
-    // return res.json()
-
-    // Stub: simulate API response
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    return {
-      quoteId: `stub-quote-${Date.now()}`,
-      estimatedOut: '1000000000',
-      priceImpactBps: 12,
-      feeLamports: 5000,
-      expiresAt: Math.floor(Date.now() / 1000) + 60,
-      transaction: 'STUB_TX_BASE64_PLACEHOLDER',
+  async health(): Promise<boolean> {
+    try {
+      const res = await this.request<string>('GET', '/api/v1/swap/health')
+      return res.isSuccess
+    } catch {
+      return false
     }
   }
 
   /**
-   * Execute a swap quote — signs and submits via Jito.
+   * Get a quote for an encrypted swap intent.
+   * The coprocessor performs token resolution, validation, and fee
+   * calculation on ciphertext, then returns the Jupiter output amount.
    *
-   * @param quote - Quote returned by submitIntent()
-   * @param signTransaction - Wallet signing function
-   * @returns Transaction signature and confirmed result
+   * @param intent - Encrypted swap intent from encrypt()
+   * @returns Estimated output amount
    */
-  async executeQuote(
-    quote: SwapQuote,
-    signTransaction: (tx: unknown) => Promise<unknown>
-  ): Promise<SwapResult> {
-    // TODO: Replace stub with real execution
-    // const signedTx = await signTransaction(deserializeTx(quote.transaction))
-    // const sig = await sendAndConfirmViajito(signedTx)
+  async quote(intent: EncryptedIntent): Promise<QuoteResult> {
+    const res = await this.request<string>('POST', '/api/v1/quote', intent)
+    return { outAmount: String(res.result) }
+  }
 
-    await signTransaction(quote.transaction)
-    return {
-      signature: `stub-sig-${Date.now()}`,
-      inputAmount: 'stub-in',
-      outputAmount: quote.estimatedOut,
+  /**
+   * Prepare a swap — runs FHE computation, verification, threshold
+   * decryption, and builds an unsigned Jupiter transaction.
+   *
+   * @param intent - Encrypted swap intent (must include id + account)
+   * @returns Unsigned transaction ready for wallet signing
+   */
+  async prepare(intent: EncryptedIntent): Promise<PrepareResult> {
+    const res = await this.request<PrepareResult>('POST', '/api/v1/swap/prepare', intent)
+    return res.result as PrepareResult
+  }
+
+  /**
+   * Execute a prepared swap — submit the signed transaction via Jito.
+   *
+   * @param req - Session ID and base64-encoded signed transaction
+   * @returns Transaction signature
+   */
+  async execute(req: ExecuteRequest): Promise<ExecuteResult> {
+    const res = await this.request<ExecuteResult>('POST', '/api/v1/swap/execute', req)
+    return res.result as ExecuteResult
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal
+  // ---------------------------------------------------------------------------
+
+  private async request<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<GatewayResponse<T>> {
+    const url = `${this.baseUrl}${path}`
+    const init: RequestInit = {
+      method,
+      headers: { 'Content-Type': 'application/json' },
     }
+    if (body !== undefined) {
+      init.body = JSON.stringify(body)
+    }
+
+    const res = await fetch(url, init)
+
+    let data: GatewayResponse<T>
+    try {
+      data = await res.json()
+    } catch {
+      throw new GatewayError(
+        `Gateway returned non-JSON response (${res.status})`,
+        res.status,
+      )
+    }
+
+    if (!res.ok || !data.isSuccess) {
+      throw new GatewayError(
+        data.log ?? `Gateway error (${res.status})`,
+        res.status,
+        data.log,
+      )
+    }
+
+    return data
   }
 }

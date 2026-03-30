@@ -5,11 +5,14 @@
  * Encrypt user data in the browser, compute on ciphertext.
  *
  * @example
+ * ```ts
  * import { AuraShield } from '@aura/shield-sdk'
  *
  * const shield = new AuraShield({ rpc, wallet })
  * await shield.init()
  * const result = await shield.swap({ tokenOut: 'SOL', amountOut: 1_000_000_000, tokenIn: 'USDC' })
+ * console.log('TX:', result.signature)
+ * ```
  */
 
 // Main class
@@ -21,10 +24,14 @@ export type {
   WalletAdapter,
   SwapParams,
   EncryptedIntent,
-  SwapQuote,
+  QuoteResult,
+  PrepareResult,
   SwapResult,
+  GatewayResponse,
+  ExecuteRequest,
+  ExecuteResult,
 } from './types'
 
-// Low-level API (for advanced usage)
-export { encryptSwapParams, loadAfheWasm } from './encrypt'
-export { CoprocessorClient, DEFAULT_API_ENDPOINT } from './client'
+// Low-level API (advanced usage)
+export { encryptSwapParams, loadAfheWasm, isAfheLoaded, afheVersion } from './encrypt'
+export { CoprocessorClient, GatewayError, DEFAULT_GATEWAY_URL } from './client'

@@ -1,18 +1,35 @@
-import { ShieldConfig, SwapParams, EncryptedIntent, SwapQuote, SwapResult } from './types'
-import { loadAfheWasm, encryptSwapParams } from './encrypt'
-import { CoprocessorClient, DEFAULT_API_ENDPOINT } from './client'
+import type {
+  ShieldConfig,
+  SwapParams,
+  EncryptedIntent,
+  PrepareResult,
+  SwapResult,
+  QuoteResult,
+} from './types'
+import { loadAfheWasm, encryptSwapParams, isAfheLoaded } from './encrypt'
+import { CoprocessorClient, DEFAULT_GATEWAY_URL } from './client'
 
 /**
- * AuraShield — the main entry point for the @aura/shield-sdk
+ * AuraShield — the main entry point for the @aura/shield-sdk.
  *
- * Encrypts user data client-side using FHE, submits to the
- * coprocessor network for private computation, and executes
- * the result on Solana.
+ * Encrypts user swap data client-side using AFHE, submits to the
+ * coprocessor network for homomorphic computation, and executes
+ * the result on Solana via Jupiter + Jito.
  *
  * @example
+ * ```ts
+ * import { AuraShield } from '@aura/shield-sdk'
+ *
  * const shield = new AuraShield({ rpc, wallet })
  * await shield.init()
- * const result = await shield.swap({ tokenOut: 'SOL', amountOut: 1e9, tokenIn: 'USDC' })
+ *
+ * const result = await shield.swap({
+ *   tokenOut: 'SOL',
+ *   amountOut: 1_000_000_000,
+ *   tokenIn: 'USDC',
+ * })
+ * console.log('TX:', result.signature)
+ * ```
  */
 export class AuraShield {
   private config: ShieldConfig
@@ -21,74 +38,125 @@ export class AuraShield {
 
   constructor(config: ShieldConfig) {
     this.config = {
-      apiEndpoint: DEFAULT_API_ENDPOINT,
+      gatewayUrl: DEFAULT_GATEWAY_URL,
       ...config,
     }
-    this.client = new CoprocessorClient(this.config.apiEndpoint)
+    this.client = new CoprocessorClient(this.config.gatewayUrl)
   }
 
-  /**
-   * Initialize the SDK — loads the AFHE WASM encryption module.
-   * Must be called before encrypt(), submit(), execute(), or swap().
-   */
+  /** Initialize the SDK — loads the AFHE WASM encryption module. */
   async init(): Promise<void> {
     if (this.initialized) return
     await loadAfheWasm()
     this.initialized = true
   }
 
-  /**
-   * Encrypt swap parameters client-side using AFHE WASM.
-   * No plaintext leaves the browser.
-   *
-   * @param params - Swap parameters (tokenOut, amountOut, tokenIn)
-   * @returns Encrypted intent ready for coprocessor submission
-   */
-  async encrypt(params: SwapParams): Promise<EncryptedIntent> {
-    this.assertInitialized()
-    return encryptSwapParams(params)
+  /** Returns true if the AFHE module is loaded and ready. */
+  get ready(): boolean {
+    return this.initialized && isAfheLoaded()
   }
 
   /**
-   * Submit an encrypted intent to the coprocessor network.
-   * Token resolution, slippage validation, and fee calculation
-   * all happen on ciphertext.
-   *
-   * @param intent - Encrypted swap intent from encrypt()
-   * @returns Quote with ready-to-sign execution transaction
+   * Check if the coprocessor gateway is healthy and reachable.
    */
-  async submit(intent: EncryptedIntent): Promise<SwapQuote> {
-    this.assertInitialized()
-    return this.client.submitIntent(intent)
+  async health(): Promise<boolean> {
+    return this.client.health()
   }
 
   /**
-   * Execute a swap quote by signing and submitting via Jito.
+   * Encrypt swap parameters client-side.
+   * Each field is encrypted individually with AFHE so the coprocessor
+   * can perform homomorphic operations on them.
    *
-   * @param quote - Quote returned by submit()
-   * @returns Transaction signature and swap result
+   * @param params - Plaintext swap parameters
+   * @returns Encrypted intent matching the gateway TaskInput schema
    */
-  async execute(quote: SwapQuote): Promise<SwapResult> {
+  encrypt(params: SwapParams): EncryptedIntent {
+    this.assertInitialized()
+    const account = this.getWalletAddress()
+    return encryptSwapParams(params, account)
+  }
+
+  /**
+   * Get a price quote for an encrypted swap.
+   * The coprocessor runs FHE computation and returns the estimated
+   * Jupiter output — without ever seeing the plaintext intent.
+   */
+  async getQuote(params: SwapParams): Promise<QuoteResult> {
+    const intent = this.encrypt(params)
+    return this.client.quote(intent)
+  }
+
+  /**
+   * Prepare a swap — encrypt, compute on ciphertext, verify, decrypt
+   * only the final output, and return an unsigned Jupiter transaction.
+   *
+   * @param params - Swap parameters
+   * @returns Unsigned transaction ready for wallet signing
+   */
+  async prepare(params: SwapParams): Promise<PrepareResult & { sessionId: string }> {
+    const intent = this.encrypt(params)
+    const result = await this.client.prepare(intent)
+    return { ...result, sessionId: intent.id }
+  }
+
+  /**
+   * Execute a prepared swap — sign the transaction and submit via Jito.
+   *
+   * @param sessionId - Session ID from prepare()
+   * @param swapTransaction - Base64 unsigned tx from prepare()
+   * @returns Transaction signature
+   */
+  async execute(sessionId: string, swapTransaction: string): Promise<SwapResult> {
     this.assertInitialized()
     const { wallet } = this.config
-    return this.client.executeQuote(quote, (tx) => wallet.signTransaction(tx))
+
+    // Deserialize, sign, and re-serialize the transaction.
+    // The wallet adapter handles the actual signing.
+    const signedTx = await wallet.signTransaction(swapTransaction)
+
+    const result = await this.client.execute({
+      id: sessionId,
+      signed_tx: typeof signedTx === 'string' ? signedTx : String(signedTx),
+    })
+
+    return {
+      signature: result.signature,
+      outAmount: '',
+      sessionId,
+    }
   }
 
   /**
-   * Convenience method: encrypt + submit + execute in one call.
+   * One-call swap: encrypt → prepare → sign → execute.
    *
    * @param params - Swap parameters (tokenOut, amountOut, tokenIn)
-   * @returns Completed swap result
+   * @returns Completed swap result with transaction signature
    */
   async swap(params: SwapParams): Promise<SwapResult> {
-    const intent = await this.encrypt(params)
-    const quote = await this.submit(intent)
-    return this.execute(quote)
+    const prepared = await this.prepare(params)
+    const result = await this.execute(prepared.sessionId, prepared.swapTransaction)
+    return {
+      ...result,
+      outAmount: prepared.outAmount,
+    }
   }
+
+  // ---------------------------------------------------------------------------
+  // Private helpers
+  // ---------------------------------------------------------------------------
 
   private assertInitialized(): void {
     if (!this.initialized) {
       throw new Error('AuraShield not initialized. Call shield.init() first.')
     }
+  }
+
+  private getWalletAddress(): string {
+    const pk = this.config.wallet.publicKey
+    if (!pk) {
+      throw new Error('Wallet not connected — publicKey is null.')
+    }
+    return pk.toBase58?.() ?? pk.toString()
   }
 }
