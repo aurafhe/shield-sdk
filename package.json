@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Fully Homomorphic Encryption for Solana — encrypt user data in the browser, compute on ciphertext",
   "main": "dist/index.js",
-  "module": "dist/index.esm.js",
   "types": "dist/index.d.ts",
   "files": ["dist"],
   "scripts": {
