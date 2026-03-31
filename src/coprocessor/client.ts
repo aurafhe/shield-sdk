@@ -1,14 +1,12 @@
 /**
- * Generic coprocessor client.
+ * Coprocessor gateway client.
  *
- * This client communicates with the Aura coprocessor gateway.
- * It is not swap-specific — any dApp module can use it to submit
- * encrypted tasks for FHE computation.
+ * Communicates with the Aura coprocessor gateway over HTTPS.
+ * Validates all responses before returning to the caller.
  */
 
 import type {
   GatewayResponse,
-  TaskInput,
   SwapTaskInput,
   SwapPrepareResult,
   ExecuteRequest,
@@ -32,22 +30,9 @@ export class GatewayError extends Error {
 /**
  * HTTP client for the Aura coprocessor gateway.
  *
- * Supports both high-level swap operations and generic encrypted
- * task submission for custom dApp modules.
- *
  * @example
  * ```ts
  * const client = new CoprocessorClient('https://api.afhe.io')
- *
- * // Generic task
- * const result = await client.submitTask({
- *   id: 'my-task-1',
- *   type: 'custom',
- *   account: wallet.publicKey.toBase58(),
- *   encrypted: { amount: encryptedAmount, recipient: encryptedRecipient },
- * })
- *
- * // Swap-specific
  * const quote = await client.quote(encryptedSwapIntent)
  * ```
  */
@@ -64,10 +49,10 @@ export class CoprocessorClient {
   }
 
   // -------------------------------------------------------------------------
-  // Generic task API
+  // Health
   // -------------------------------------------------------------------------
 
-  /** Check if the gateway is healthy */
+  /** Check if the gateway is healthy and reachable */
   async health(): Promise<boolean> {
     try {
       const res = await this.request<string>('GET', '/api/v1/swap/health')
@@ -77,44 +62,49 @@ export class CoprocessorClient {
     }
   }
 
-  /**
-   * Submit a generic encrypted task to the coprocessor.
-   * Use this for custom dApp modules beyond swaps.
-   *
-   * @param task - Encrypted task with arbitrary fields
-   * @returns Gateway response with task-specific result
-   */
-  async submitTask<T = unknown>(task: TaskInput): Promise<GatewayResponse<T>> {
-    return this.request<T>('POST', '/api/v1/tasks', task)
-  }
-
   // -------------------------------------------------------------------------
-  // Swap-specific API
+  // Swap API (maps to coprocessor gateway endpoints)
   // -------------------------------------------------------------------------
 
   /**
    * Get a quote for an encrypted swap.
-   * Runs FHE computation and returns estimated Jupiter output.
+   * The coprocessor runs FHE computation (EvalLUT, CompareEnc, DivideCipher)
+   * and returns the estimated Jupiter output amount.
    */
   async quote(intent: SwapTaskInput): Promise<{ outAmount: string }> {
+    validateSwapInput(intent)
     const res = await this.request<string>('POST', '/api/v1/quote', intent)
     return { outAmount: String(res.result) }
   }
 
   /**
-   * Prepare a swap — FHE compute + verify + decrypt + unsigned Jupiter tx.
+   * Prepare a swap — FHE compute + 2-node verification + threshold KMS
+   * decryption + unsigned Jupiter transaction.
+   *
+   * @returns Unsigned VersionedTransaction (base64) ready for wallet signing
    */
   async prepare(intent: SwapTaskInput): Promise<SwapPrepareResult> {
+    validateSwapInput(intent)
     const res = await this.request<SwapPrepareResult>('POST', '/api/v1/swap/prepare', intent)
-    return res.result as SwapPrepareResult
+    const result = res.result as SwapPrepareResult
+    validatePrepareResult(result)
+    return result
   }
 
   /**
-   * Execute — submit signed transaction via Jito.
+   * Execute — submit the wallet-signed transaction via Jito's private mempool.
    */
   async execute(req: ExecuteRequest): Promise<ExecuteResult> {
+    if (!req.id || !req.signed_tx) {
+      throw new GatewayError('execute requires id and signed_tx', 400)
+    }
+    validateBase64(req.signed_tx, 'signed_tx')
     const res = await this.request<ExecuteResult>('POST', '/api/v1/swap/execute', req)
-    return res.result as ExecuteResult
+    const result = res.result as ExecuteResult
+    if (!result?.signature || typeof result.signature !== 'string') {
+      throw new GatewayError('Gateway returned invalid execute result: missing signature', 502)
+    }
+    return result
   }
 
   // -------------------------------------------------------------------------
@@ -156,5 +146,39 @@ export class CoprocessorClient {
     }
 
     return data
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input & response validators
+// ---------------------------------------------------------------------------
+
+function validateSwapInput(intent: SwapTaskInput): void {
+  if (!intent.id) throw new GatewayError('Missing session id', 400)
+  if (!intent.account) throw new GatewayError('Missing wallet account', 400)
+  if (!intent.token_out) throw new GatewayError('Missing encrypted token_out', 400)
+  if (!intent.amount_out) throw new GatewayError('Missing encrypted amount_out', 400)
+  if (!intent.token_in) throw new GatewayError('Missing encrypted token_in', 400)
+}
+
+function validatePrepareResult(result: SwapPrepareResult): void {
+  if (!result) {
+    throw new GatewayError('Gateway returned empty prepare result', 502)
+  }
+  if (!result.swapTransaction || typeof result.swapTransaction !== 'string') {
+    throw new GatewayError('Gateway returned invalid prepare result: missing swapTransaction', 502)
+  }
+  validateBase64(result.swapTransaction, 'swapTransaction')
+  if (!result.outAmount) {
+    throw new GatewayError('Gateway returned invalid prepare result: missing outAmount', 502)
+  }
+  if (typeof result.lastValidBlockHeight !== 'number' || result.lastValidBlockHeight <= 0) {
+    throw new GatewayError('Gateway returned invalid prepare result: bad lastValidBlockHeight', 502)
+  }
+}
+
+function validateBase64(value: string, field: string): void {
+  if (!/^[A-Za-z0-9+/=]+$/.test(value)) {
+    throw new GatewayError(`Invalid base64 in ${field}`, 400)
   }
 }

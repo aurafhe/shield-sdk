@@ -55,7 +55,11 @@ export type { SwapParams, SwapResult, ShieldConfig } from './swap'
 export {
   initAfhe,
   isAfheReady,
+  isStubMode,
   afheVersion,
+  requireRealAfhe,
+  validateCiphertext,
+  MIN_REAL_CIPHERTEXT_BYTES,
   encryptInt,
   encryptString,
   encryptBinary,
@@ -90,13 +94,12 @@ export type {
 } from './core'
 
 // ---------------------------------------------------------------------------
-// Coprocessor client (for custom task submission)
+// Coprocessor client
 // ---------------------------------------------------------------------------
 export { CoprocessorClient, GatewayError, DEFAULT_GATEWAY_URL } from './coprocessor'
 
 export type {
   GatewayResponse,
-  TaskInput,
   SwapTaskInput,
   TaskOutput,
   SwapPrepareResult,

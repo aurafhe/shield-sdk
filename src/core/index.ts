@@ -8,7 +8,11 @@
 export {
   initAfhe,
   isAfheReady,
+  isStubMode,
   afheVersion,
+  requireRealAfhe,
+  validateCiphertext,
+  MIN_REAL_CIPHERTEXT_BYTES,
   // Encryption
   encryptInt,
   encryptString,

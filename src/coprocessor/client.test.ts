@@ -11,88 +11,174 @@ describe('coprocessor/client', () => {
     mockFetch.mockReset()
   })
 
-  test('health returns true when gateway is up', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ isSuccess: true, result: 'service available' }),
+  describe('health', () => {
+    test('returns true when gateway is up', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ isSuccess: true, result: 'service available' }),
+      })
+      expect(await client.health()).toBe(true)
     })
-    expect(await client.health()).toBe(true)
+
+    test('returns false when unreachable', async () => {
+      mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'))
+      expect(await client.health()).toBe(false)
+    })
   })
 
-  test('health returns false when unreachable', async () => {
-    mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'))
-    expect(await client.health()).toBe(false)
+  describe('quote', () => {
+    test('sends encrypted intent and returns outAmount', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ isSuccess: true, result: '1500000000' }),
+      })
+
+      const result = await client.quote({
+        id: 'test', account: 'W111',
+        token_out: 'ENC_SOL', amount_out: 'ENC_1000', token_in: 'ENC_USDC',
+      })
+      expect(result.outAmount).toBe('1500000000')
+    })
+
+    test('rejects missing fields', async () => {
+      await expect(
+        client.quote({ id: '', account: 'W', token_out: 'x', amount_out: 'x', token_in: 'x' }),
+      ).rejects.toThrow('Missing session id')
+    })
   })
 
-  test('quote sends encrypted intent', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ isSuccess: true, result: '1500000000' }),
+  describe('prepare', () => {
+    test('returns validated SwapPrepareResult', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          isSuccess: true,
+          result: {
+            swapTransaction: 'dGVzdA==', // valid base64
+            outAmount: '1500000000',
+            lastValidBlockHeight: 123,
+          },
+        }),
+      })
+
+      const result = await client.prepare({
+        id: 'test', account: 'W111',
+        token_out: 'ENC_SOL', amount_out: 'ENC_1000', token_in: 'ENC_USDC',
+      })
+      expect(result.swapTransaction).toBe('dGVzdA==')
+      expect(result.lastValidBlockHeight).toBe(123)
     })
 
-    const result = await client.quote({
-      id: 'test', account: 'W111',
-      token_out: 'ENC_SOL', amount_out: 'ENC_1000', token_in: 'ENC_USDC',
+    test('rejects invalid swapTransaction (not base64)', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          isSuccess: true,
+          result: {
+            swapTransaction: 'not valid base64!!!',
+            outAmount: '1500000000',
+            lastValidBlockHeight: 123,
+          },
+        }),
+      })
+
+      await expect(
+        client.prepare({
+          id: 'test', account: 'W111',
+          token_out: 'ENC_SOL', amount_out: 'ENC_1000', token_in: 'ENC_USDC',
+        }),
+      ).rejects.toThrow('Invalid base64')
     })
-    expect(result.outAmount).toBe('1500000000')
+
+    test('rejects missing outAmount', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          isSuccess: true,
+          result: { swapTransaction: 'dGVzdA==', outAmount: '', lastValidBlockHeight: 123 },
+        }),
+      })
+
+      await expect(
+        client.prepare({
+          id: 'test', account: 'W111',
+          token_out: 'x', amount_out: 'x', token_in: 'x',
+        }),
+      ).rejects.toThrow('missing outAmount')
+    })
+
+    test('rejects bad lastValidBlockHeight', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          isSuccess: true,
+          result: { swapTransaction: 'dGVzdA==', outAmount: '100', lastValidBlockHeight: -1 },
+        }),
+      })
+
+      await expect(
+        client.prepare({
+          id: 'test', account: 'W111',
+          token_out: 'x', amount_out: 'x', token_in: 'x',
+        }),
+      ).rejects.toThrow('bad lastValidBlockHeight')
+    })
   })
 
-  test('prepare returns swapTransaction', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        isSuccess: true,
-        result: { swapTransaction: 'base64tx', outAmount: '1500000000', lastValidBlockHeight: 123 },
-      }),
+  describe('execute', () => {
+    test('returns signature on success', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ isSuccess: true, result: { signature: '5xAbc...' } }),
+      })
+
+      const result = await client.execute({ id: 'test', signed_tx: 'dGVzdA==' })
+      expect(result.signature).toBe('5xAbc...')
     })
 
-    const result = await client.prepare({
-      id: 'test', account: 'W111',
-      token_out: 'ENC_SOL', amount_out: 'ENC_1000', token_in: 'ENC_USDC',
+    test('rejects missing signed_tx', async () => {
+      await expect(
+        client.execute({ id: 'test', signed_tx: '' }),
+      ).rejects.toThrow('execute requires id and signed_tx')
     })
-    expect(result.swapTransaction).toBe('base64tx')
+
+    test('rejects invalid base64 in signed_tx', async () => {
+      await expect(
+        client.execute({ id: 'test', signed_tx: 'not base64!!!' }),
+      ).rejects.toThrow('Invalid base64')
+    })
   })
 
-  test('execute returns signature', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ isSuccess: true, result: { signature: '5xAbc...' } }),
+  describe('error handling', () => {
+    test('throws GatewayError on non-success response', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 502,
+        json: async () => ({ isSuccess: false, log: 'node timeout' }),
+      })
+
+      await expect(
+        client.quote({
+          id: 'x', account: 'x', token_out: 'x', amount_out: 'x', token_in: 'x',
+        }),
+      ).rejects.toThrow(GatewayError)
     })
 
-    const result = await client.execute({ id: 'test', signed_tx: 'signed_base64' })
-    expect(result.signature).toBe('5xAbc...')
-  })
+    test('GatewayError has status and log', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        json: async () => ({ isSuccess: false, log: 'bad request' }),
+      })
 
-  test('submitTask sends generic encrypted task', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({ isSuccess: true, result: { status: 'completed' } }),
+      try {
+        await client.quote({ id: 'x', account: 'x', token_out: 'x', amount_out: 'x', token_in: 'x' })
+        fail('should throw')
+      } catch (e) {
+        const err = e as GatewayError
+        expect(err.status).toBe(400)
+        expect(err.log).toBe('bad request')
+      }
     })
-
-    const result = await client.submitTask({
-      id: 'lending-1',
-      type: 'lending',
-      account: 'W111',
-      encrypted: { collateral: 'ENC_1000', borrowToken: 'ENC_USDC' },
-    })
-    expect(result.isSuccess).toBe(true)
-
-    const [url, init] = mockFetch.mock.calls[0]
-    expect(url).toContain('/api/v1/tasks')
-    const body = JSON.parse(init.body)
-    expect(body.type).toBe('lending')
-    expect(body.encrypted.collateral).toBe('ENC_1000')
-  })
-
-  test('throws GatewayError on failure', async () => {
-    mockFetch.mockResolvedValueOnce({
-      ok: false,
-      status: 502,
-      json: async () => ({ isSuccess: false, log: 'node timeout' }),
-    })
-
-    await expect(client.quote({
-      id: 'x', account: 'x', token_out: 'x', amount_out: 'x', token_in: 'x',
-    })).rejects.toThrow(GatewayError)
   })
 })

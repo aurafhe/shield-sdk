@@ -6,7 +6,7 @@
  * can leverage the Aura coprocessor for encrypted computation.
  */
 
-import { initAfhe, isAfheReady, encryptInt, encryptString } from '../core'
+import { initAfhe, isAfheReady, isStubMode, encryptInt, encryptString } from '../core'
 import { CoprocessorClient, DEFAULT_GATEWAY_URL } from '../coprocessor'
 import type { SwapTaskInput, SwapPrepareResult } from '../coprocessor'
 import type { SwapParams, SwapResult, ShieldConfig } from './types'
@@ -34,6 +34,11 @@ export class AuraShield {
   /** True if the AFHE module is loaded and ready */
   get ready(): boolean {
     return this.initialized && isAfheReady()
+  }
+
+  /** True if running in stub mode (development only — no real FHE) */
+  get stubMode(): boolean {
+    return isStubMode()
   }
 
   /** Check if the coprocessor gateway is reachable */

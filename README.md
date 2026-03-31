@@ -1,8 +1,21 @@
 # @aura/shield-sdk
 
-The developer SDK for building dApps and web3 products on the Aura FHE coprocessor. Encrypt user data in the browser, compute on ciphertext, decrypt only when needed.
+The developer SDK for building dApps on the Aura FHE coprocessor. Encrypt user data client-side, compute on ciphertext server-side, decrypt only at execution.
 
-## Quick Start — Swap
+## Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| SDK API surface | **Stable** | Types, client, AuraShield class |
+| Stub encryption (dev) | **Ready** | AES-256-GCM opaque stubs — safe for development |
+| AFHE WASM (production) | **Pending** | Real FHE encryption — requires `@aura/afhe-wasm` |
+| Coprocessor gateway | **Ready** | Go coprocessor with 55 homomorphic operations |
+| KMS threshold | **In progress** | Shamir splitting works, final decryption integration pending |
+| Jito MEV protection | **Ready** | Private mempool submission |
+
+> **Development mode** produces genuinely opaque ciphertexts (AES-256-GCM with ephemeral keys). Plaintext cannot be recovered from stub output. However, these are NOT FHE ciphertexts — the coprocessor cannot perform homomorphic operations on them. Production mode requires the AFHE WASM module.
+
+## Quick Start
 
 ```bash
 npm install @aura/shield-sdk
@@ -12,7 +25,7 @@ npm install @aura/shield-sdk
 import { AuraShield } from '@aura/shield-sdk'
 
 const shield = new AuraShield({ rpc, wallet })
-await shield.init()
+await shield.init()  // Loads encryption engine (stub in dev, AFHE WASM in prod)
 
 const result = await shield.swap({
   tokenOut: 'SOL',
@@ -22,59 +35,27 @@ const result = await shield.swap({
 console.log('TX:', result.signature)
 ```
 
-Three lines. Your user's swap intent was encrypted in their browser. Token resolution, amount validation, and fee calculation all happened on ciphertext. Nobody saw plaintext until the final KMS decryption for execution.
-
-## Build Anything on Encrypted Computation
-
-Swaps are the first module. The SDK exposes **55 AFHE homomorphic operations** — you can build any dApp that needs private computation:
-
-```typescript
-import { initAfhe, encryptInt, encryptString, multiply, add, compareEnc, CoprocessorClient } from '@aura/shield-sdk'
-
-await initAfhe()
-
-// Encrypt user data client-side
-const amount = encryptInt(1_000_000_000)
-const token = encryptString('USDC')
-
-// Compute on ciphertext (no decryption)
-const fee = multiply(amount, encryptInt(15))  // 15 bps fee
-const total = add(amount, fee)
-const isValid = compareEnc(total, encryptInt(0))  // Encrypted boolean
-
-// Submit to coprocessor for execution
-const client = new CoprocessorClient('https://api.afhe.io')
-const result = await client.submitTask({
-  id: 'my-task',
-  type: 'lending',
-  account: wallet.publicKey.toBase58(),
-  encrypted: { amount: total as string, token: token as string },
-})
-```
-
-**Use cases beyond swaps:** lending/borrowing protection, NFT bid privacy, governance voting, limit order hiding, OTC dark pools, cross-chain bridge privacy.
-
 ## Architecture
 
 ```
 @aura/shield-sdk
-├── core/          55 AFHE encryption primitives
+├── core/          AFHE encryption primitives
 │   ├── Encrypt:   encryptInt, encryptString, encryptBinary
 │   ├── Arithmetic: add, subtract, multiply, divide
-│   ├── Compare:   compareEnc (returns encrypted result)
+│   ├── Compare:   compareEnc (encrypted result)
 │   ├── Logic:     xor, and, or, not
-│   ├── Math:      abs, sqrt, log, exp, sin, cos, tan ...
-│   ├── String:    concat, substring
+│   ├── Math:      abs, sqrt, log, exp
+│   ├── String:    concat
 │   └── Crypto:    sign, verify, sm3
 │
-├── coprocessor/   Generic coprocessor client
-│   ├── submitTask()   Submit any encrypted computation
-│   ├── quote()        Get swap price quote
-│   ├── prepare()      Build unsigned Jupiter tx
-│   └── execute()      Submit signed tx via Jito
+├── coprocessor/   Gateway client with response validation
+│   ├── health()      Gateway connectivity check
+│   ├── quote()       Price quote via FHE computation
+│   ├── prepare()     Unsigned Jupiter tx (validated base64)
+│   └── execute()     Signed tx submission via Jito
 │
 └── swap/          MEV-protected swaps (first module)
-    └── AuraShield     encrypt → prepare → sign → execute
+    └── AuraShield    encrypt → prepare → sign → execute
 ```
 
 ## How the Coprocessor Works
@@ -82,47 +63,59 @@ const result = await client.submitTask({
 ```
 Browser                    Coprocessor Network              Solana
 ─────────────────          ──────────────────────           ──────
-1. User inputs data
-2. AFHE WASM encrypts ──►  3. Gateway receives ciphertext
-   each field                 (never sees plaintext)
-                           4. Nodes compute on ciphertext:
-                              - EvalLUT (token resolution)
-                              - CompareEnc (validation)
-                              - MultiplyCipher (fees)
-                              - All 55 ops available
-                           5. Verification (2-node recompute)
-                           6. KMS threshold decryption (T-of-N)
-                           7. Result → execution ──────────► 8. On-chain settlement
-                    ◄──────────────────────────────────────── 9. TX signature
+1. User inputs swap
+2. AFHE encrypts ────────►  3. Gateway receives ciphertext
+   each field                  (never sees plaintext)
+                            4. Nodes compute on ciphertext:
+                               - EvalLUT (token resolution)
+                               - CompareEnc (validation)
+                               - MultiplyCipher (fees)
+                            5. 2-node verification
+                            6. KMS threshold decryption
+                            7. Jupiter quote + tx ──────────► 8. Jito submission
+                                                               9. Settlement
+                     ◄──────────────────────────────────────── 10. TX signature
 ```
 
-This is not a mixer, VPN, or private mempool. The computation itself happens on encrypted data using Fully Homomorphic Encryption.
+## Safety Guards
+
+The SDK includes built-in protections:
+
+- **`isStubMode()`** — Check if running with stub or real encryption
+- **`requireRealAfhe()`** — Throws in stub mode (use before production submission)
+- **`validateCiphertext(ct)`** — Verify ciphertext format and size
+- **Opaque stubs** — Even in dev mode, ciphertexts are AES-256-GCM encrypted with ephemeral keys. Plaintext cannot be recovered from stub output.
+- **Response validation** — Gateway responses are validated for structure, base64 format, and field presence before being returned to the caller
+- **Console warnings** — `initAfhe()` warns when running in stub mode
 
 ## Swap API
 
 | Method | Description |
 |--------|-------------|
-| `shield.init()` | Load AFHE WASM encryption module |
+| `shield.init()` | Load encryption engine |
 | `shield.encrypt(params)` | Encrypt swap params client-side |
-| `shield.getQuote(params)` | Get price quote via FHE computation |
-| `shield.prepare(params)` | Build unsigned Jupiter transaction |
+| `shield.getQuote(params)` | Price quote via FHE computation |
+| `shield.prepare(params)` | Build unsigned Jupiter tx |
 | `shield.execute(id, tx)` | Sign and submit via Jito |
 | `shield.swap(params)` | All-in-one: encrypt + prepare + sign + execute |
-| `shield.health()` | Check gateway connectivity |
+| `shield.health()` | Gateway connectivity check |
+| `shield.ready` | Is the encryption engine loaded? |
+| `shield.stubMode` | Is this stub mode (dev) or real AFHE? |
 
 ## Core Encryption API
 
-| Category | Functions |
-|----------|-----------|
-| **Encrypt** | `encryptInt`, `encryptString`, `encryptBinary` |
-| **Arithmetic** | `add`, `subtract`, `multiply`, `divide` |
-| **Compare** | `compareEnc` (encrypted result — coprocessor can't see outcome) |
-| **Logic** | `xor`, `and`, `or`, `not` |
-| **Math** | `abs`, `sqrt`, `log`, `exp` |
-| **String** | `concat` |
-| **Crypto** | `sign`, `verify`, `sm3` |
+For building custom encrypted dApps beyond swaps:
 
-All operations return ciphertext. No decryption occurs outside the KMS.
+```typescript
+import { initAfhe, encryptInt, encryptString, multiply, add, compareEnc } from '@aura/shield-sdk'
+
+await initAfhe()
+
+const amount = encryptInt(1_000_000_000)
+const fee = multiply(amount, encryptInt(15))
+const total = add(amount, fee)
+const isValid = compareEnc(total, encryptInt(0))
+```
 
 ## Gateway Endpoints
 
@@ -132,18 +125,16 @@ All operations return ciphertext. No decryption occurs outside the KMS.
 | POST | `/api/v1/quote` | Price quote (encrypted input) |
 | POST | `/api/v1/swap/prepare` | Prepare unsigned transaction |
 | POST | `/api/v1/swap/execute` | Submit signed transaction |
-| POST | `/api/v1/tasks` | Generic encrypted task submission |
 
 ## Examples
 
 - [Basic Swap](./examples/basic-swap) — Simplest integration
-- See [docs/architecture.md](./docs/architecture.md) for detailed coprocessor flow
 
 ## Links
 
-- **Live Demo:** [shield.afhe.io](https://shield.afhe.io)
-- **Docs:** [docs.afhe.io](https://docs.afhe.io)
-- **Website:** [afhe.io](https://afhe.io)
+- [shield.afhe.io](https://shield.afhe.io)
+- [docs.afhe.io](https://docs.afhe.io)
+- [afhe.io](https://afhe.io)
 
 ## License
 

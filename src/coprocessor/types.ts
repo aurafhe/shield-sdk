@@ -14,26 +14,7 @@ export interface GatewayResponse<T = unknown> {
 }
 
 /**
- * Generic encrypted task input sent to the coprocessor.
- *
- * The `type` field determines how the coprocessor processes the task.
- * The `encrypted` object contains arbitrary AFHE ciphertext fields.
- */
-export interface TaskInput {
-  /** Client-provided UUID for session correlation */
-  id: string
-  /** Task type (e.g. 'swap', 'lend', 'vote', 'transfer') */
-  type: string
-  /** User's Solana wallet address (base58) — NOT encrypted */
-  account: string
-  /** Encrypted fields — keys and values are task-type specific */
-  encrypted: Record<string, string>
-  /** Optional plaintext metadata (non-sensitive) */
-  metadata?: Record<string, string | number>
-}
-
-/**
- * Swap-specific task input — the most common task type.
+ * Swap task input — encrypted fields sent to the coprocessor gateway.
  * Matches Go `TaskInput` in the coprocessor gateway.
  */
 export interface SwapTaskInput {
