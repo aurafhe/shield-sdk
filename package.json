@@ -1,7 +1,7 @@
 {
   "name": "@aura/shield-sdk",
   "version": "0.1.0",
-  "description": "Fully Homomorphic Encryption for Solana — encrypt user data in the browser, compute on ciphertext",
+  "description": "Encrypted DeFi SDK for Solana — protect swaps, lending, and trading from MEV with FHE",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist"],

@@ -1,9 +1,9 @@
 /**
  * @aura/shield-sdk
  *
- * The developer SDK for building dApps and web3 products on the
- * Aura FHE coprocessor. Encrypt user data in the browser, compute
- * on ciphertext, decrypt only when needed.
+ * Encrypted DeFi SDK for Solana — powered by the Aura FHE coprocessor.
+ * Protect swaps, lending, and trading from MEV with real Fully
+ * Homomorphic Encryption.
  *
  * ## Architecture
  *
