@@ -1,6 +1,6 @@
 # Contributing to @aura/shield-sdk
 
-We welcome contributions from the Solana community. This guide covers how to get started.
+We welcome contributions. This guide covers how to get started.
 
 ## Development Setup
 
@@ -24,10 +24,8 @@ npx tsc --noEmit   # Type check without emitting
 
 ```
 src/
-  core/          # AFHE encryption primitives (55 operations)
-  coprocessor/   # Gateway client (HTTP + validation)
-  swap/          # AuraShield swap module (first DeFi module)
-  index.ts       # Public API barrel export
+  index.ts         # AfheClient class and types
+  index.test.ts    # Unit tests
 ```
 
 ## Making Changes
@@ -46,24 +44,6 @@ src/
 - All public functions must have JSDoc comments
 - No `any` types (use `unknown` if needed)
 - Tests in the same directory as source (`*.test.ts`)
-- Prefer explicit over clever
-
-## Adding a New DeFi Module
-
-The SDK is designed for extensibility. To add a new module (e.g., lending):
-
-1. Create `src/lending/` with `types.ts`, `lending.ts`, `index.ts`
-2. Import primitives from `../core` (encryption) and `../coprocessor` (gateway client)
-3. Export from `src/index.ts`
-4. Add tests in `src/lending/lending.test.ts`
-
-## Encryption Engine
-
-The `core/encrypt.ts` has two modes:
-- **Stub mode** (default): AES-256-GCM opaque ciphertexts for safe development
-- **Real mode** (coming): AFHE WASM module for production FHE
-
-When adding operations, implement in the `AfheEngine` interface and both `createStubEngine()` and the future WASM engine.
 
 ## Reporting Issues
 

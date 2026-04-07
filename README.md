@@ -1,134 +1,247 @@
 # @aura/shield-sdk
 
-Encrypted DeFi SDK for Solana — powered by the Aura FHE coprocessor. Protect swaps, lending, and trading from MEV with real Fully Homomorphic Encryption.
+TypeScript client SDK for the Aura Fully Homomorphic Encryption service. Encrypt values, compute on ciphertexts, decrypt results, and sign/verify — all over HTTPS.
 
-## Status
+**Zero dependencies. Isomorphic.** Works in Node.js 18+, modern browsers, Deno, Bun, and Cloudflare Workers.
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| SDK API surface | **Stable** | Types, client, AuraShield class |
-| Stub encryption (dev) | **Ready** | AES-256-GCM opaque stubs — safe for development |
-| AFHE WASM (production) | **Pending** | Real FHE encryption — requires `@aura/afhe-wasm` |
-| Coprocessor gateway | **Ready** | Go coprocessor with 55 homomorphic operations |
-| KMS threshold | **In progress** | Shamir splitting works, final decryption integration pending |
-| Jito MEV protection | **Ready** | Private mempool submission |
-
-> **Development mode** produces genuinely opaque ciphertexts (AES-256-GCM with ephemeral keys). Plaintext cannot be recovered from stub output. However, these are NOT FHE ciphertexts — the coprocessor cannot perform homomorphic operations on them. Production mode requires the AFHE WASM module.
-
-## Quick Start
+## Installation
 
 ```bash
 npm install @aura/shield-sdk
 ```
 
+## Quick Start
+
 ```typescript
-import { AuraShield } from '@aura/shield-sdk'
+import { AfheClient } from '@aura/shield-sdk'
 
-const shield = new AuraShield({ rpc, wallet })
-await shield.init()  // Loads encryption engine (stub in dev, AFHE WASM in prod)
-
-const result = await shield.swap({
-  tokenOut: 'SOL',
-  amountOut: 1_000_000_000,
-  tokenIn: 'USDC',
+const client = new AfheClient({
+  baseUrl: 'https://api.afhe.io:8443',
+  timeoutMs: 600_000,
 })
-console.log('TX:', result.signature)
+
+// 1. Generate keys (slow first time; skips on repeat runs)
+await client.keygen()
+
+// 2. Load key blocks
+await client.load({ skb: 'file/skb', pkb: 'file/pkb', dictb: 'file/dictb' })
+
+// 3. Encrypt two integers
+const ca = await client.encryptInt(25)
+const cb = await client.encryptInt(17)
+
+// 4. Add them homomorphically — the server never sees the values
+const cSum = await client.addInt(ca, cb)
+
+// 5. Decrypt the result
+const plaintext = await client.decryptInt(cSum)
+console.log(plaintext) // "42"
 ```
 
-## Architecture
+## Constructor
 
-```
-@aura/shield-sdk
-├── core/          AFHE encryption primitives
-│   ├── Encrypt:   encryptInt, encryptString, encryptBinary
-│   ├── Arithmetic: add, subtract, multiply, divide
-│   ├── Compare:   compareEnc (encrypted result)
-│   ├── Logic:     xor, and, or, not
-│   ├── Math:      abs, sqrt, log, exp
-│   ├── String:    concat
-│   └── Crypto:    sign, verify, sm3
-│
-├── coprocessor/   Gateway client with response validation
-│   ├── health()      Gateway connectivity check
-│   ├── quote()       Price quote via FHE computation
-│   ├── prepare()     Unsigned Jupiter tx (validated base64)
-│   └── execute()     Signed tx submission via Jito
-│
-└── swap/          MEV-protected swaps (first module)
-    └── AuraShield    encrypt → prepare → sign → execute
+```typescript
+const client = new AfheClient({
+  baseUrl: 'https://api.afhe.io:8443', // required
+  fetch: customFetch,                    // optional — defaults to globalThis.fetch
+  headers: { 'X-Tenant': 'acme' },      // optional — merged into every request
+  timeoutMs: 30_000,                     // optional — per-request timeout
+  signal: parentController.signal,       // optional — default AbortSignal
+})
 ```
 
-## How the Coprocessor Works
+### Self-Signed TLS (Node.js)
 
-```
-Browser                    Coprocessor Network              Solana
-─────────────────          ──────────────────────           ──────
-1. User inputs swap
-2. AFHE encrypts ────────►  3. Gateway receives ciphertext
-   each field                  (never sees plaintext)
-                            4. Nodes compute on ciphertext:
-                               - EvalLUT (token resolution)
-                               - CompareEnc (validation)
-                               - MultiplyCipher (fees)
-                            5. 2-node verification
-                            6. KMS threshold decryption
-                            7. Jupiter quote + tx ──────────► 8. Jito submission
-                                                               9. Settlement
-                     ◄──────────────────────────────────────── 10. TX signature
+For local development with the default self-signed certificate:
+
+```typescript
+import { Agent, setGlobalDispatcher } from 'undici'
+
+setGlobalDispatcher(new Agent({
+  connect: { rejectUnauthorized: false },
+}))
 ```
 
-## Safety Guards
+In production, always use real TLS certificates.
 
-The SDK includes built-in protections:
+## API Reference
 
-- **`isStubMode()`** — Check if running with stub or real encryption
-- **`requireRealAfhe()`** — Throws in stub mode (use before production submission)
-- **`validateCiphertext(ct)`** — Verify ciphertext format and size
-- **Opaque stubs** — Even in dev mode, ciphertexts are AES-256-GCM encrypted with ephemeral keys. Plaintext cannot be recovered from stub output.
-- **Response validation** — Gateway responses are validated for structure, base64 format, and field presence before being returned to the caller
-- **Console warnings** — `initAfhe()` warns when running in stub mode
+All methods return Promises and throw `AfheApiError` on non-2xx responses.
 
-## Swap API
+### Health & Discovery
 
 | Method | Description |
 |--------|-------------|
-| `shield.init()` | Load encryption engine |
-| `shield.encrypt(params)` | Encrypt swap params client-side |
-| `shield.getQuote(params)` | Price quote via FHE computation |
-| `shield.prepare(params)` | Build unsigned Jupiter tx |
-| `shield.execute(id, tx)` | Sign and submit via Jito |
-| `shield.swap(params)` | All-in-one: encrypt + prepare + sign + execute |
-| `shield.health()` | Gateway connectivity check |
-| `shield.ready` | Is the encryption engine loaded? |
-| `shield.stubMode` | Is this stub mode (dev) or real AFHE? |
+| `client.health()` | Liveness probe |
+| `client.functions()` | List available operations grouped by arity |
 
-## Core Encryption API
+### Initialisation & Keys
 
-For building custom encrypted dApps beyond swaps:
+| Method | Description |
+|--------|-------------|
+| `client.init()` | Explicit SDK init (rarely needed; server auto-inits) |
+| `client.keygen(opts?)` | Generate SKB + PKB + DictB key blocks |
+| `client.load({ skb?, pkb?, dictb? })` | Load key blocks into the runtime |
+
+### Encrypt / Decrypt
 
 ```typescript
-import { initAfhe, encryptInt, encryptString, multiply, add, compareEnc } from '@aura/shield-sdk'
+// Private-key encryption (requires SKB loaded)
+client.encryptInt(value)
+client.encryptFloat(value)
+client.encryptString(value)
+client.encryptBinary(value)
 
-await initAfhe()
+// Public-key encryption (requires PKB loaded)
+client.encryptPublicInt(value)
+client.encryptPublicFloat(value)
+client.encryptPublicString(value)
+client.encryptPublicBinary(value)
 
-const amount = encryptInt(1_000_000_000)
-const fee = multiply(amount, encryptInt(15))
-const total = add(amount, fee)
-const isValid = compareEnc(total, encryptInt(0))
+// Decryption (requires SKB loaded)
+client.decryptInt(ciphertext)
+client.decryptFloat(ciphertext)
+client.decryptString(ciphertext)
+client.decryptBinary(ciphertext)
 ```
 
-## Gateway Endpoints
+### Integer Arithmetic
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/swap/health` | Health check |
-| POST | `/api/v1/quote` | Price quote (encrypted input) |
-| POST | `/api/v1/swap/prepare` | Prepare unsigned transaction |
-| POST | `/api/v1/swap/execute` | Submit signed transaction |
+Requires **DictB** loaded. Operates on `int` domain ciphertexts.
+
+```typescript
+client.addInt(a, b)
+client.subInt(a, b)
+client.mulInt(a, b)
+client.divInt(a, b)
+```
+
+### Float Arithmetic
+
+Requires **DictB** loaded. Operates on `float` domain ciphertexts.
+
+```typescript
+client.addFloat(a, b)
+client.subFloat(a, b)
+client.mulFloat(a, b)
+client.divFloat(a, b)
+```
+
+### Bitwise Operations
+
+Requires **DictB** loaded. Operates on `binary` domain ciphertexts (32-bit).
+
+```typescript
+client.xor(a, b)
+client.and(a, b)
+client.or(a, b)
+client.not(a)
+client.shiftLeft(c, bias)
+client.shiftRight(c, bias)
+client.rotateLeft(c, bias)
+client.rotateRight(c, bias)
+client.cmux(sel, a, b)     // per-bit multiplexer
+```
+
+### String Operations
+
+Requires **DictB** loaded. Operates on `string` domain ciphertexts.
+
+```typescript
+client.concatString(a, b)
+client.substring(input, start, end)
+```
+
+### Scientific Functions
+
+Requires **both PKB and DictB** loaded. Operates on `float` domain ciphertexts.
+
+```typescript
+client.power(c, n, m)   // c^(n/m); use m=1 for integer exponents
+client.sqrt(c)
+client.log(c)            // natural log
+client.exp(c)            // e^c
+client.sin(c)   client.cos(c)   client.tan(c)
+client.asin(c)  client.acos(c)  client.atan(c)
+client.sinh(c)  client.cosh(c)  client.tanh(c)
+client.asinh(c) client.acosh(c) client.atanh(c)
+```
+
+### Cross-Type Operations
+
+```typescript
+client.compare(a, b)  // works on int, float, string, binary — requires DictB
+client.abs(c)         // works on int, float — requires DictB
+```
+
+### Signatures
+
+```typescript
+client.genSign(message)             // requires SKB
+client.verifySign(message, sig)     // requires DictB
+```
+
+### Generic Dispatcher
+
+For any operation not covered by a typed helper:
+
+```typescript
+client.call(fnName, args)   // e.g. client.call('AddCipherInt', [c1, c2])
+```
+
+## Domain & Key Compatibility
+
+Every value belongs to exactly one domain. **Never mix domains** across operations.
+
+### Operations by Domain
+
+| Operation | `int` | `float` | `string` | `binary` |
+|-----------|:-----:|:-------:|:--------:|:--------:|
+| Add / Sub / Mul / Div | Y | Y | | |
+| Compare | Y | Y | Y | Y |
+| ABS | Y | Y | | |
+| XOR / AND / OR / NOT | | | | Y |
+| Shift / Rotate / CMux | | | | Y |
+| Concat / Substring | | | Y | |
+| Scientific (sqrt, sin, ...) | | Y | | |
+
+### Required Key Blocks
+
+| Operation | SKB | PKB | DictB |
+|-----------|:---:|:---:|:-----:|
+| Encrypt (private) | Y | | |
+| Encrypt (public) | | Y | |
+| Decrypt | Y | | |
+| Arithmetic / Bitwise / String / Compare / ABS | | | Y |
+| Scientific functions | | Y | Y |
+| GenSign | Y | | |
+| VerifySign | | | Y |
+
+## Error Handling
+
+All methods throw `AfheApiError` on non-2xx responses:
+
+```typescript
+import { AfheClient, AfheApiError } from '@aura/shield-sdk'
+
+try {
+  await client.call('UnknownFn', ['x'])
+} catch (err) {
+  if (err instanceof AfheApiError) {
+    console.error(`HTTP ${err.status}: ${err.message}`)
+    console.error('Response body:', err.body)
+  }
+}
+```
+
+| Status | Cause |
+|--------|-------|
+| `400` | Unknown function name, wrong argument count, or invalid domain |
+| `500` | Server error (keys not loaded, invalid ciphertext, etc.) |
 
 ## Examples
 
-- [Basic Swap](./examples/basic-swap) — Simplest integration
+- [Basic Operations](./examples/basic-operations/) — Encrypt, compute, decrypt
 
 ## Links
 
