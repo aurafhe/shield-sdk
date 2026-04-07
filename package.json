@@ -4,7 +4,19 @@
   "description": "TypeScript client SDK for the Aura Fully Homomorphic Encryption service",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "files": ["dist"],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",

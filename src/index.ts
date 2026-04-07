@@ -25,8 +25,12 @@
 /** Plaintext domain for an encrypt/decrypt operation. */
 export type Domain = "int" | "float" | "string" | "binary";
 
-/** Opaque ciphertext string returned by the server. */
-export type Ciphertext = string;
+/**
+ * Opaque ciphertext string returned by the server.
+ * Branded so you cannot accidentally pass a plaintext string where a
+ * ciphertext is expected.
+ */
+export type Ciphertext = string & { readonly __brand: unique symbol };
 
 /** Options accepted by the {@link AfheClient} constructor. */
 export interface AfheClientOptions {
@@ -40,6 +44,11 @@ export interface AfheClientOptions {
   signal?: AbortSignal;
   /** Request timeout in milliseconds (default: no timeout). */
   timeoutMs?: number;
+  /**
+   * Number of retries for transient failures (5xx, network errors).
+   * Defaults to 0 (no retries). Uses exponential backoff starting at 1s.
+   */
+  retries?: number;
 }
 
 /** Body accepted by {@link AfheClient.keygen}. All fields are optional. */
@@ -63,10 +72,17 @@ export interface KeygenResult {
   dictb_file: string;
 }
 
-/** Body accepted by {@link AfheClient.load}. Load only what the role needs. */
+/**
+ * Body accepted by {@link AfheClient.load}.
+ * Load only what the role needs. Values are **file paths** on the server,
+ * e.g. `"file/skb"`, not the file contents.
+ */
 export interface LoadOptions {
+  /** Path to the Secret Key Block file on the server. */
   skb?: string;
+  /** Path to the Public Key Block file on the server. */
   pkb?: string;
+  /** Path to the Dictionary Block file on the server. */
   dictb?: string;
 }
 
@@ -80,13 +96,14 @@ export interface FunctionsList {
   arity3: string[];
 }
 
-/** Thrown when the server returns a non-2xx response or a malformed body. */
+/** Thrown on non-2xx responses, malformed bodies, and network errors. */
 export class AfheApiError extends Error {
   public readonly status: number;
   public readonly body: unknown;
   constructor(message: string, status: number, body: unknown) {
     super(message);
     this.name = "AfheApiError";
+    Object.setPrototypeOf(this, AfheApiError.prototype);
     this.status = status;
     this.body = body;
   }
@@ -99,22 +116,52 @@ export class AfheApiError extends Error {
 export class AfheClient {
   private readonly baseUrl: string;
   private readonly fetchImpl: typeof fetch;
-  private readonly headers: Record<string, string>;
+  private readonly defaultHeaders: Record<string, string>;
   private readonly defaultSignal?: AbortSignal;
   private readonly timeoutMs?: number;
+  private readonly retries: number;
 
   constructor(opts: AfheClientOptions) {
     if (!opts.baseUrl) throw new Error("AfheClient: baseUrl is required");
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.fetchImpl = opts.fetch ?? globalThis.fetch.bind(globalThis);
-    this.headers = { "Content-Type": "application/json", ...(opts.headers ?? {}) };
+    this.defaultHeaders = opts.headers ?? {};
     this.defaultSignal = opts.signal;
     this.timeoutMs = opts.timeoutMs;
+    this.retries = opts.retries ?? 0;
   }
 
   // ---- low-level request plumbing ----------------------------------------
 
   private async request<T>(
+    method: "GET" | "POST",
+    path: string,
+    body?: unknown,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 0; attempt <= this.retries; attempt++) {
+      if (attempt > 0) {
+        await sleep(Math.min(1000 * Math.pow(2, attempt - 1), 10_000));
+      }
+
+      try {
+        return await this.doRequest<T>(method, path, body, signal);
+      } catch (err) {
+        lastError = err;
+        // Only retry on network errors (status 0) or 5xx server errors
+        if (err instanceof AfheApiError && err.status > 0 && err.status < 500) {
+          throw err; // 4xx are not retryable
+        }
+        if (attempt === this.retries) break;
+      }
+    }
+
+    throw lastError;
+  }
+
+  private async doRequest<T>(
     method: "GET" | "POST",
     path: string,
     body?: unknown,
@@ -126,12 +173,21 @@ export class AfheClient {
       ? setTimeout(() => controller.abort(new Error(`timeout after ${this.timeoutMs}ms`)), this.timeoutMs!)
       : undefined;
 
+    // Combine all signals: user per-call > default > timeout
+    const combinedSignal = combineSignals(signal, this.defaultSignal, controller?.signal);
+
+    // Only set Content-Type on requests with a body
+    const headers: Record<string, string> = { ...this.defaultHeaders };
+    if (body !== undefined) {
+      headers["Content-Type"] = "application/json";
+    }
+
     try {
       const res = await this.fetchImpl(url, {
         method,
-        headers: this.headers,
+        headers,
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal: signal ?? this.defaultSignal ?? controller?.signal,
+        signal: combinedSignal,
       });
 
       const text = await res.text();
@@ -146,12 +202,22 @@ export class AfheClient {
 
       if (!res.ok) {
         const msg =
-          (parsed && typeof parsed === "object" && "error" in (parsed as Record<string, unknown>)
+          parsed && typeof parsed === "object" && parsed !== null && "error" in parsed
             ? String((parsed as Record<string, unknown>).error)
-            : `HTTP ${res.status} from ${path}`);
+            : `HTTP ${res.status} from ${path}`;
         throw new AfheApiError(msg, res.status, parsed);
       }
+
+      if (parsed === undefined) {
+        throw new AfheApiError(`empty response body from ${path}`, res.status, text);
+      }
+
       return parsed as T;
+    } catch (err) {
+      if (err instanceof AfheApiError) throw err;
+      // Wrap network errors (DNS failure, TLS error, abort, etc.)
+      const message = err instanceof Error ? err.message : String(err);
+      throw new AfheApiError(`network error: ${message}`, 0, err);
     } finally {
       if (timer) clearTimeout(timer);
     }
@@ -164,14 +230,14 @@ export class AfheClient {
     return this.request("GET", "/health", undefined, signal);
   }
 
-  /** `GET /functions` — list every SDK function the generic `/call` router accepts. */
+  /** `GET /functions` — list every function the generic `/call` router accepts. */
   functions(signal?: AbortSignal): Promise<FunctionsList> {
     return this.request("GET", "/functions", undefined, signal);
   }
 
   // ---- init / keys -------------------------------------------------------
 
-  /** `POST /init` — call the SDK's `Init()` (usually unnecessary; server auto-inits). */
+  /** `POST /init` — call `Init()` (usually unnecessary; server auto-inits). */
   init(signal?: AbortSignal): Promise<{ ok: boolean }> {
     return this.request("POST", "/init", {}, signal);
   }
@@ -184,7 +250,10 @@ export class AfheClient {
     return this.request("POST", "/keygen", opts, signal);
   }
 
-  /** `POST /load` — load any subset of key blocks into the runtime. */
+  /**
+   * `POST /load` — load key blocks into the runtime.
+   * Values are **file paths on the server**, e.g. `"file/skb"`.
+   */
   load(opts: LoadOptions, signal?: AbortSignal): Promise<LoadResult> {
     return this.request("POST", "/load", opts, signal);
   }
@@ -201,13 +270,14 @@ export class AfheClient {
     value: string | number,
     opts: { public?: boolean; signal?: AbortSignal } = {},
   ): Promise<Ciphertext> {
+    validateNumericValue(value);
     const res = await this.request<{ ciphertext: string }>(
       "POST",
       `/encrypt/${domain}`,
       { value: String(value), public: opts.public ?? false },
       opts.signal,
     );
-    return res.ciphertext;
+    return res.ciphertext as Ciphertext;
   }
 
   /** `POST /decrypt/{domain}` — decrypt a ciphertext. Requires loaded SKB. */
@@ -232,14 +302,14 @@ export class AfheClient {
    * reachable here. Prefer the typed helpers below so argument arity
    * is checked at compile time.
    */
-  async call(fn: string, args: string[], signal?: AbortSignal): Promise<string> {
+  async call(fn: string, args: string[], signal?: AbortSignal): Promise<Ciphertext> {
     const res = await this.request<{ result: string }>(
       "POST",
       "/call",
       { fn, args },
       signal,
     );
-    return res.result;
+    return res.result as Ciphertext;
   }
 
   /** `POST /verify` — verify a signature. Requires loaded DictB. */
@@ -440,12 +510,62 @@ export class AfheClient {
 
   // ---- Signing -----------------------------------------------------------
 
-  genSign(input: string, signal?: AbortSignal): Promise<string> {
-    return this.call("GenSign", [input], signal);
+  /** `GenSign` — sign a plaintext input. Requires loaded SKB. Returns a signature string. */
+  async genSign(input: string, signal?: AbortSignal): Promise<string> {
+    const res = await this.request<{ result: string }>(
+      "POST",
+      "/call",
+      { fn: "GenSign", args: [input] },
+      signal,
+    );
+    return res.result;
   }
+  /** Alias for {@link verify}. */
   verifySign(input: string, sign: string, signal?: AbortSignal): Promise<boolean> {
     return this.verify(input, sign, signal);
   }
 }
 
 export default AfheClient;
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/** Combine multiple optional AbortSignals into one. All signals are respected. */
+function combineSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const defined = signals.filter((s): s is AbortSignal => s != null);
+  if (defined.length === 0) return undefined;
+  if (defined.length === 1) return defined[0];
+
+  // AbortSignal.any is available in Node 20+, modern browsers
+  if (typeof AbortSignal !== "undefined" && "any" in AbortSignal) {
+    return (AbortSignal as { any(signals: AbortSignal[]): AbortSignal }).any(defined);
+  }
+
+  // Fallback: manual linking for older runtimes
+  const controller = new AbortController();
+  for (const sig of defined) {
+    if (sig.aborted) {
+      controller.abort(sig.reason);
+      return controller.signal;
+    }
+    sig.addEventListener("abort", () => controller.abort(sig.reason), { once: true });
+  }
+  return controller.signal;
+}
+
+/** Validate that a numeric value is not NaN or Infinity before sending to the server. */
+function validateNumericValue(value: string | number): void {
+  if (typeof value === "number" && (!Number.isFinite(value))) {
+    throw new AfheApiError(
+      `invalid value: ${value} (must be a finite number or string)`,
+      0,
+      undefined,
+    );
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
